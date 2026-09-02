@@ -1,4 +1,5 @@
 use super::*;
+use crate::message::resource::aaaa::AaaaResource;
 use sansio::Protocol;
 use shared::error::Error;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -355,4 +356,98 @@ fn test_query_timeout_config() {
     let config = MdnsConfig::default();
     let conn = Mdns::new(now, config);
     assert_eq!(conn.query_timeout, None);
+}
+
+/// Build a signed-off mDNS response packet carrying one address record for `name`.
+fn answer_packet(name: &str, addr: IpAddr) -> BytesMut {
+    let body: Box<dyn crate::message::resource::ResourceBody> = match addr {
+        IpAddr::V4(ip) => Box::new(AResource { a: ip.octets() }),
+        IpAddr::V6(ip) => Box::new(AaaaResource { aaaa: ip.octets() }),
+    };
+    let mut msg = Message {
+        header: Header {
+            response: true,
+            authoritative: true,
+            ..Default::default()
+        },
+        answers: vec![Resource {
+            header: ResourceHeader {
+                typ: if addr.is_ipv4() {
+                    DnsType::A
+                } else {
+                    DnsType::Aaaa
+                },
+                class: DNSCLASS_INET,
+                name: Name::new(&format!("{name}.")).unwrap(),
+                ttl: RESPONSE_TTL,
+                ..Default::default()
+            },
+            body: Some(body),
+        }],
+        ..Default::default()
+    };
+    BytesMut::from(&msg.pack().unwrap()[..])
+}
+
+fn deliver(mdns: &mut Mdns, name: &str, addr: IpAddr, src: IpAddr) {
+    mdns.handle_read(TaggedBytesMut {
+        now: Instant::now(),
+        transport: TransportContext {
+            local_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), MDNS_PORT),
+            peer_addr: SocketAddr::new(src, MDNS_PORT),
+            transport_protocol: TransportProtocol::UDP,
+            ecn: None,
+        },
+        message: answer_packet(name, addr),
+    })
+    .unwrap();
+}
+
+/// The header filter admits both `A` and `AAAA`, so an `AAAA` answer must be decoded as the IPv6
+/// address it carries. Downcasting only to `AResource` silently discarded it and fell back to the
+/// packet source -- resolving a `.local` candidate to the wrong address on a dual-stack link.
+#[test]
+fn test_aaaa_answer_resolves_to_the_address_in_the_record() {
+    let name = "test-host.local";
+    let v6: IpAddr = "fe80::1c2:3d4:5e6:7f8".parse().unwrap();
+
+    let mut mdns = Mdns::new(Instant::now(), MdnsConfig::default());
+    let id = mdns.query_now(Instant::now(), name);
+
+    // Source address deliberately differs from the record: a multi-homed responder answers from
+    // whichever interface the query arrived on. The record is what's authoritative.
+    deliver(
+        &mut mdns,
+        name,
+        v6,
+        IpAddr::V4(Ipv4Addr::new(192, 168, 1, 9)),
+    );
+
+    assert!(matches!(
+        mdns.poll_event(),
+        Some(MdnsEvent::QueryAnswered(qid, addr)) if qid == id && addr == v6
+    ));
+    assert!(!mdns.is_query_pending(id));
+}
+
+/// A link carries every other host's Bonjour/Avahi announcements. Answers for names we never asked
+/// about must be dropped without inspection -- and, crucially, without a WARN, since a busy office
+/// LAN would otherwise fill the log with records belonging to unrelated devices.
+#[test]
+fn test_unsolicited_answers_are_ignored() {
+    let mut mdns = Mdns::new(Instant::now(), MdnsConfig::default());
+    let id = mdns.query_now(Instant::now(), "wanted.local");
+
+    deliver(
+        &mut mdns,
+        "some-printer.local",
+        IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
+        IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
+    );
+
+    assert!(
+        mdns.poll_event().is_none(),
+        "no event for a name we never queried"
+    );
+    assert!(mdns.is_query_pending(id), "our own query must stay pending");
 }

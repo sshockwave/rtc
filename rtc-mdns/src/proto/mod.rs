@@ -4,7 +4,7 @@
 //! documentation and examples live so that rustdoc renders them and their doctests run.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
@@ -17,6 +17,7 @@ use crate::message::name::Name;
 use crate::message::parser::Parser;
 use crate::message::question::Question;
 use crate::message::resource::a::AResource;
+use crate::message::resource::aaaa::AaaaResource;
 use crate::message::resource::{Resource, ResourceHeader};
 use crate::message::{DNSCLASS_INET, DnsType, Message};
 use shared::error::{Error, Result};
@@ -663,30 +664,55 @@ impl Mdns {
                 }
             };
 
-            let local_ip = if let Some(body) = answer_resource.body
-                && let Some(a) = body.as_any().downcast_ref::<AResource>()
+            // A link carries every other host's Bonjour/Avahi traffic, so most answers are not
+            // ours. Match against the pending queries before inspecting or logging the record --
+            // otherwise unrelated announcements are reported as though we had asked for them.
+            if !self
+                .queries
+                .iter()
+                .any(|q| q.name_with_suffix == answer_header.name.data)
             {
-                let local_ip = Ipv4Addr::from_octets(a.a).into();
-                if local_ip != src.ip() {
-                    warn!(
-                        "mDNS answers with different local ip on AResource {} vs src ip {} on Socket for query {}",
-                        local_ip,
-                        src.ip(),
-                        answer_header.name.data
-                    );
-                } else {
-                    trace!(
-                        "mDNS answers with the local ip {} on AResource and Socket for query {}",
-                        local_ip, answer_header.name.data
-                    );
-                }
+                continue;
+            }
 
-                local_ip
+            let local_ip = if let Some(body) = answer_resource.body {
+                let any = body.as_any();
+                // The header filter above admits both A and AAAA; decode whichever this is.
+                let addr = any
+                    .downcast_ref::<AResource>()
+                    .map(|a| IpAddr::from(Ipv4Addr::from_octets(a.a)))
+                    .or_else(|| {
+                        any.downcast_ref::<AaaaResource>()
+                            .map(|a| IpAddr::from(Ipv6Addr::from_octets(a.aaaa)))
+                    });
+
+                match addr {
+                    Some(local_ip) => {
+                        // An address record whose payload differs from the packet source is
+                        // routine, not suspect: a multi-homed responder answers from whichever
+                        // interface the query arrived on. The record is authoritative.
+                        trace!(
+                            "mDNS answer for query {} resolved to {} (src ip {})",
+                            answer_header.name.data,
+                            local_ip,
+                            src.ip()
+                        );
+                        local_ip
+                    }
+                    None => {
+                        warn!(
+                            "mDNS answer for query {} carried no address record, falling back to src ip {}",
+                            answer_header.name.data,
+                            src.ip()
+                        );
+                        src.ip()
+                    }
+                }
             } else {
                 warn!(
-                    "mDNS answers without AResource, fallback to use src ip {} on Socket for local ip for query {}",
-                    src.ip(),
-                    answer_header.name.data
+                    "mDNS answer for query {} had an empty body, falling back to src ip {}",
+                    answer_header.name.data,
+                    src.ip()
                 );
                 src.ip()
             };
