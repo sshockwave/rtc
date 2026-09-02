@@ -2939,6 +2939,57 @@ fn test_handle_inbound_request_defers_failing_connectivity_check() -> Result<()>
 // `add_remote_candidate` takes no instant, so it only *schedules* the query; the
 // packet is stamped and emitted by the next `handle_timeout`, which does have one.
 // `poll_timeout` reports an already-due deadline so the driver comes back at once.
+/// An ICE restart begins a new session with fresh credentials. A `.local` candidate whose mDNS
+/// resolution was still in flight belongs to the *old* session: if the answer lands afterwards the
+/// agent would add a remote candidate whose connectivity checks can only fail MESSAGE-INTEGRITY
+/// against the new ufrag/pwd. `apply_restart` must therefore drop the pending resolutions and
+/// cancel the underlying queries, so no more retries go out on the wire either.
+#[test]
+fn test_apply_restart_drops_in_flight_mdns_queries() -> Result<()> {
+    let cand_line =
+        "1114572465 1 udp 2113939711 61b445d2-6503-41ac-96ce-ee3edac00e9f.local 61163 typ host";
+    let base = Instant::now();
+
+    let mut agent = Agent::new(
+        base,
+        Arc::new(AgentConfig {
+            multicast_dns_mode: crate::mdns::MulticastDnsMode::QueryOnly,
+            ..Default::default()
+        }),
+        test_crypto_provider(),
+    )?;
+
+    agent.add_remote_candidate(unmarshal_candidate(cand_line)?)?;
+    let query_id = *agent
+        .mdns_queries
+        .keys()
+        .next()
+        .expect("the .local candidate must have scheduled an mDNS query");
+    assert!(
+        agent
+            .mdns
+            .as_ref()
+            .is_some_and(|m| m.is_query_pending(query_id) || m.pending_query_count() > 0),
+        "the query must be live before the restart"
+    );
+
+    agent.apply_restart(base, true)?;
+
+    assert!(
+        agent.mdns_queries.is_empty(),
+        "a candidate resolved after the restart would be checked with credentials it was never \
+         offered under"
+    );
+    assert_eq!(
+        agent.mdns.as_ref().map_or(0, |m| m.pending_query_count()),
+        0,
+        "the underlying query must be cancelled too, so its retries stop being transmitted"
+    );
+
+    agent.close()?;
+    Ok(())
+}
+
 #[test]
 fn test_query_only_agent_queries_mdns_remote_candidate() -> Result<()> {
     // A .local host candidate in Safari's exact format.

@@ -717,6 +717,16 @@ impl Agent {
 
         self.candidate_pairs = vec![];
 
+        // In-flight `.local` resolutions belong to the session being torn down: their candidates
+        // were keyed on the old remote credentials, so an answer arriving after the restart would
+        // add a remote candidate whose checks can only fail authentication. Cancel the queries
+        // too, so the retries stop going out on the wire.
+        for query_id in self.mdns_queries.drain().map(|(id, _)| id) {
+            if let Some(mdns_conn) = &mut self.mdns {
+                mdns_conn.cancel_query(query_id);
+            }
+        }
+
         self.set_selected_pair(Some(now), None);
         self.delete_all_candidates(keep_local_candidates);
         self.start(now);
